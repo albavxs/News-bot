@@ -538,40 +538,41 @@ def main():
     else:
         print("[WARN] DISCORD_BOT_TOKEN não configurado — comandos desativados")
 
-    last_blog_run = 0
-    last_news_run = 0  # roda imediatamente na primeira vez, depois espera 1h
+    # Próximos ciclos agendados
+    next_blog_run = time.time()                        # roda imediatamente
+    next_news_run = time.time() + NEWS_CYCLE_INTERVAL  # espera 1h
 
     while True:
-        now = time.time()
-
         if state["paused"] and not state["force_now"]:
-            time.sleep(5)
+            time.sleep(10)
             continue
 
+        now   = time.time()
         force = state["force_now"]
         if force:
             state["force_now"] = False
 
-        # Ciclo de blogs (15min)
-        if force or (now - last_blog_run >= BLOG_CYCLE_INTERVAL):
+        # Ciclo de blogs
+        if now >= next_blog_run or force:
             try:
                 run_blog_cycle()
             except Exception as e:
                 print(f"[ERROR] Blogs: {e}")
-            last_blog_run = time.time()
-            remaining_news = max(0, NEWS_CYCLE_INTERVAL - (time.time() - last_news_run))
-            next_news = datetime.fromtimestamp(time.time() + remaining_news).strftime("%H:%M:%S")
-            print(f"  Próximo jornal às {next_news} (em {int(remaining_news//60)}min)")
+            next_blog_run = time.time() + BLOG_CYCLE_INTERVAL
+            next_blog_str = datetime.fromtimestamp(next_blog_run).strftime("%H:%M:%S")
+            print(f"  Próximo ciclo de blogs às {next_blog_str}")
 
-        # Ciclo de jornais (1h) — nunca roda junto com blogs
-        if not force and (now - last_news_run >= NEWS_CYCLE_INTERVAL):
+        # Ciclo de jornais — só depois de 1h, nunca junto com blogs
+        elif now >= next_news_run:
             try:
                 run_news_cycle()
             except Exception as e:
                 print(f"[ERROR] Jornais: {e}")
-            last_news_run = time.time()
+            next_news_run = time.time() + NEWS_CYCLE_INTERVAL
+            next_news_str = datetime.fromtimestamp(next_news_run).strftime("%H:%M:%S")
+            print(f"  Próximo ciclo de jornais às {next_news_str}")
 
-        time.sleep(5)
+        time.sleep(10)
 
 if __name__ == "__main__":
     try:
