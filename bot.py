@@ -117,6 +117,19 @@ def init_db():
             posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS queue (
+            id          TEXT PRIMARY KEY,
+            source      TEXT NOT NULL,
+            title       TEXT,
+            link        TEXT,
+            description TEXT,
+            image       TEXT,
+            color       INTEGER,
+            published   TEXT,
+            queued_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -146,6 +159,48 @@ def count_total_seen() -> int:
     n    = conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
     conn.close()
     return n
+
+def enqueue(post: dict):
+    """Adiciona post à fila se ainda não foi visto nem está na fila."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        INSERT OR IGNORE INTO queue (id, source, title, link, description, image, color, published)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (post["id"], post["source"], post["title"], post["link"],
+          post.get("description",""), post.get("image",""),
+          post.get("color", 0), post.get("published","")))
+    conn.commit()
+    conn.close()
+
+def dequeue() -> dict | None:
+    """Pega o próximo post da fila (mais antigo primeiro)."""
+    conn = sqlite3.connect(DB_PATH)
+    row  = conn.execute("""
+        SELECT id, source, title, link, description, image, color, published
+        FROM queue ORDER BY queued_at ASC LIMIT 1
+    """).fetchone()
+    if row:
+        conn.execute("DELETE FROM queue WHERE id = ?", (row[0],))
+        conn.commit()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "source": row[1], "title": row[2], "link": row[3],
+        "description": row[4], "image": row[5], "color": row[6], "published": row[7]
+    }
+
+def count_queue() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    n    = conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
+    conn.close()
+    return n
+
+def is_in_queue(post_id: str) -> bool:
+    conn   = sqlite3.connect(DB_PATH)
+    result = conn.execute("SELECT 1 FROM queue WHERE id = ?", (post_id,)).fetchone()
+    conn.close()
+    return result is not None
 
 # ─────────────────────────────────────────────
 # FILTRO DE RELEVÂNCIA
@@ -266,6 +321,17 @@ def fetch_rss(source: dict) -> list[dict]:
             description = get_post_description(entry)
             if not title:
                 continue
+
+            # Filtra posts com mais de 24h
+            pub_parsed = entry.get("published_parsed")
+            if pub_parsed:
+                import calendar
+                pub_ts  = calendar.timegm(pub_parsed)
+                age_h   = (time.time() - pub_ts) / 3600
+                if age_h > 2:
+                    log(f"    [SKIP] Muito antigo ({age_h:.0f}h): {title[:50]}")
+                    continue
+
             posts.append({
                 "id":          post_id,
                 "source":      source["name"],
@@ -276,7 +342,7 @@ def fetch_rss(source: dict) -> list[dict]:
                 "image":       image,
                 "description": description,
             })
-        log(f"    [RSS] {len(posts)} posts encontrados")
+        log(f"    [RSS] {len(posts)} posts nas últimas 24h")
         return posts
     except Exception as e:
         print(f"    [ERROR] {source['name']}: {e}")
@@ -378,7 +444,7 @@ def handle_command(cmd: str):
             f"Estado: {pausado}\n"
             f"Uptime: {horas}h {minutos}min\n"
             f"Notícias enviadas: {state['total_sent']}\n"
-            f"No banco: {count_total_seen()}\n"
+            f"No banco: {count_total_seen()} | Na fila: {count_queue()}\n"
             f"Último ciclo blogs: {last_blog}\n"
             f"Último ciclo jornais: {last_news}",
             color=0x51CF66 if not state["paused"] else 0xFCC419
@@ -432,22 +498,28 @@ def poll_commands():
 # ─────────────────────────────────────────────
 
 def process_source(source: dict, max_posts: int) -> int:
-    log(f"    [DB] '{source['name']}' tem {count_seen(source['name'])} posts no banco")
+    """Busca posts novos, enfileira os relevantes, envia max_posts da fila."""
     posts = fetch_rss(source)
-    if not posts:
-        return 0
 
-    new_posts = [p for p in posts if not is_seen(p["id"])]
-    new_posts = [p for p in new_posts if is_relevant(p)]
-    log(f"    [COMPARE] {len(posts)} RSS | {len(posts)-len(new_posts)} já vistos/filtrados | {len(new_posts)} novos")
+    # Enfileira posts novos e relevantes das últimas 24h
+    enqueued = 0
+    for p in posts:
+        if not is_seen(p["id"]) and not is_in_queue(p["id"]) and is_relevant(p):
+            enqueue(p)
+            enqueued += 1
+        elif not is_seen(p["id"]) and not is_in_queue(p["id"]):
+            # Marca irrelevantes como vistos pra não verificar de novo
+            mark_seen(p["id"], p["source"], p.get("title",""), p.get("link",""))
 
-    if not new_posts:
-        print(f"    — Nada novo")
-        return 0
+    if enqueued:
+        log(f"    [FILA] {enqueued} post(s) adicionado(s) | {count_queue()} na fila total")
 
-    to_send = new_posts[:max_posts]
-    sent    = 0
-    for post in reversed(to_send):
+    # Envia max_posts da fila
+    sent = 0
+    for _ in range(max_posts):
+        post = dequeue()
+        if not post:
+            break
         ok = send_to_discord(post)
         if ok:
             mark_seen(post["id"], post["source"], post["title"], post["link"])
@@ -455,10 +527,13 @@ def process_source(source: dict, max_posts: int) -> int:
             sent += 1
             state["total_sent"] += 1
         else:
-            print(f"    ✗ Falha: {post['title'][:60]}")
+            # Volta pra fila se falhou
+            enqueue(post)
+            print(f"    ✗ Falha (voltou pra fila): {post['title'][:60]}")
 
-    if len(new_posts) > max_posts:
-        print(f"    ⚠ {len(new_posts) - max_posts} adiado(s) pro próximo ciclo")
+    if sent == 0:
+        q = count_queue()
+        print(f"    — Nada enviado {'| ' + str(q) + ' na fila' if q else '| fila vazia'}")
 
     return sent
 
